@@ -112,6 +112,8 @@ Open `~/.claude/settings.json`, find `hooks.PreToolUse` (create the key if missi
 }
 ```
 
+> **Note:** the `\\` sequences are JSON string escapes for a single backslash. If GitHub or your viewer renders them as a single `\`, you must restore the doubled form when copying into `settings.json` — JSON parsers reject single backslashes.
+
 The matcher `*` fires the hook on every tool call. The hook short-circuits to exit 0 unless an active `/continuous` session state file exists, so it has no effect outside this skill.
 
 ### 3. Verify

@@ -22,6 +22,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import collections
 import glob
 import json
 import os
@@ -62,13 +63,17 @@ def discover_session_id() -> str | None:
 
 
 def _iter_lines_reverse(path: Path, max_lines: int = 200):
-    """Yield up to max_lines from the END of a JSONL file, newest first."""
+    """Yield up to max_lines from the END of a JSONL file, newest first.
+
+    Uses a bounded deque so memory stays O(max_lines) regardless of file size
+    — transcripts can grow to tens of MB and this runs on every probe.
+    """
     try:
         with path.open("r", encoding="utf-8") as f:
-            lines = f.readlines()
+            tail = collections.deque(f, maxlen=max_lines)
     except OSError:
         return
-    for line in reversed(lines[-max_lines:]):
+    for line in reversed(tail):
         yield line
 
 

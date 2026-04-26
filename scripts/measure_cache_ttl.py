@@ -175,7 +175,7 @@ def health_check(transcripts: int = 10) -> dict:
                            "Claude Code, then re-run measure_cache_ttl.py")
     recommended_action = " | ".join(actions) if actions else None
     return {"status": status, "write_ratio": round(write_ratio, 1),
-            "wake_read_input_ratio": round(wake_ratio, 1) if wake_ratio else None,
+            "wake_read_input_ratio": round(wake_ratio, 1) if wake_ratio is not None else None,
             "wake_hits": wake_hits, "notes": notes,
             "recommended_action": recommended_action}
 

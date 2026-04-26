@@ -3,11 +3,11 @@
 Combines loop_check + state read + usage fetch + TTL health into a single
 JSON object the skill body parses to decide its branch.
 
-The skill body invokes this in two modes:
-  - first activation:  python probe.py            (does loop_check)
-  - wake turn:         python probe.py --wake     (skips loop_check;
-                                                   state existence already
-                                                   implies /loop context)
+The skill body invokes this with no flags. Loop_check is automatically
+skipped on wake turns (detected by state file existence — that already
+implies a prior /loop activation in this conversation). The optional
+--wake flag forces the skip even when state is absent (useful for
+testing or explicit caller intent).
 
 Output schema:
 
@@ -145,13 +145,17 @@ def main() -> int:
     if sid is None:
         errors.append("no transcript found")
 
-    if args.wake:
+    # Resolve state first — turn_type drives whether loop_check is needed.
+    # On wake turns, state existence already implies /loop context, so the
+    # transcript walk in loop_check is redundant.
+    state_dict, turn_type = _pick_state(sid, errors)
+
+    if args.wake or turn_type == "wake":
         in_loop: bool | None = None
-        reason = "skipped (--wake)"
+        reason = "skipped (wake turn — state implies /loop context)"
     else:
         in_loop, reason = _do_loop_check(sid)
 
-    state_dict, turn_type = _pick_state(sid, errors)
     usage = _do_usage(errors)
     ttl_health = _ttl_health_throttled(errors)
 

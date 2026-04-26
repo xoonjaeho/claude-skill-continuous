@@ -89,7 +89,8 @@ per-machine runtime artifacts; clones of this repo do not ship them."""
 USAGE_CACHE_FILE = USAGE_CACHE_ROOT / "oauth-usage.json"
 """Disk cache for /api/oauth/usage responses. TTL is USAGE_CACHE_TTL_SEC.
 Written atomically via tempfile + os.replace; consumed by usage_fetch.py
-and statusline.py."""
+and, optionally, the user's private statusline (illustrative — not
+shipped with this repo)."""
 
 USAGE_LOCK_FILE = USAGE_CACHE_ROOT / "oauth-usage.lock"
 """Lock to coalesce concurrent fetches; TTL is USAGE_LOCK_TTL_SEC.
@@ -142,11 +143,22 @@ def _load_policy() -> dict:
 
 _POLICY = _load_policy()
 
-USAGE_CACHE_TTL_SEC = int(_POLICY.get("cache_ttl_sec", 60))
+
+def _policy_int(key: str, default: int) -> int:
+    """Read int from policy with fallback if key is missing or malformed
+    (e.g. null, non-numeric string). Coercion failures must not crash
+    module import — every script in this package depends on it."""
+    try:
+        return int(_POLICY.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+USAGE_CACHE_TTL_SEC = _policy_int("cache_ttl_sec", 60)
 """Disk cache TTL. Default 60s. Override via
 ~/.claude/cache/usage/.policy.json key 'cache_ttl_sec'."""
 
-USAGE_LOCK_TTL_SEC = int(_POLICY.get("lock_ttl_sec", 30))
+USAGE_LOCK_TTL_SEC = _policy_int("lock_ttl_sec", 30)
 """Lock TTL. Default 30s. Override via .policy.json key 'lock_ttl_sec'."""
 
 
