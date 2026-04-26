@@ -93,16 +93,18 @@ def _read_cache() -> dict[str, Any] | None:
 
 
 def _write_cache(payload: dict[str, Any]) -> None:
-    C.CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-    # Atomic write — consistent with state.write() and the ttl_health cache.
-    # A torn write on this file would force one extra HTTP fetch (recoverable),
-    # but atomic write is one line and matches the codebase pattern.
-    tmp = C.USAGE_CACHE_FILE.with_suffix(C.USAGE_CACHE_FILE.suffix + ".tmp")
+    C.USAGE_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+    # Atomic write with PID-suffixed tmp. The shared cache file is written by
+    # multiple processes (this skill + the user's statusline if configured);
+    # a per-process tmp name eliminates tmp-collision in the rare race where
+    # the advisory lock fails to serialize them.
+    tmp = C.USAGE_CACHE_FILE.with_suffix(
+        C.USAGE_CACHE_FILE.suffix + f".tmp.{os.getpid()}"
+    )
     try:
         tmp.write_text(json.dumps(payload), encoding="utf-8")
         os.replace(tmp, C.USAGE_CACHE_FILE)
     except OSError as e:
-        # Cache miss is recoverable; emit diagnostic, don't raise.
         print(f"[usage_fetch] cache write failed: {e}", file=sys.stderr)
         try:
             tmp.unlink(missing_ok=True)
@@ -119,7 +121,7 @@ def _take_lock() -> bool:
     Stale-lock recovery: if an existing lock is older than USAGE_LOCK_TTL_SEC,
     delete it and retry once (the previous holder almost certainly died).
     """
-    C.CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+    C.USAGE_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
     for _attempt in range(2):
         try:
             fd = os.open(str(C.USAGE_LOCK_FILE),

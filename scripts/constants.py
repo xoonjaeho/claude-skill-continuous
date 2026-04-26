@@ -5,6 +5,7 @@ SKILL.md references these by name; do not hardcode the values elsewhere.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 from pathlib import Path
@@ -76,15 +77,28 @@ def clamp_sleep(reset_remaining_sec: int, buffer: int = 60) -> int:
 # ─── Filesystem layout ──────────────────────────────────────────────────────
 
 CACHE_ROOT = Path.home() / ".claude" / "cache" / "continuous"
-"""All runtime files live here. Single root — `~/.cache/` is NOT used."""
+"""Per-session state + ttl_health throttle file. Skill-private runtime root."""
 
-USAGE_CACHE_FILE = CACHE_ROOT / "usage.json"
+USAGE_CACHE_ROOT = Path.home() / ".claude" / "cache" / "usage"
+"""Shared OAuth usage cache + lock + policy file. Read by both this skill's
+usage_fetch.py and the user's private statusline.py — co-located here so the
+two consumers see the same cache (preventing duplicate HTTP fetches and
+write races on overlapping windows). The directory and its files are
+per-machine runtime artifacts; clones of this repo do not ship them."""
+
+USAGE_CACHE_FILE = USAGE_CACHE_ROOT / "oauth-usage.json"
 """Disk cache for /api/oauth/usage responses. TTL is USAGE_CACHE_TTL_SEC.
-Tighter TTL → fresher numbers in the hook → detection closer to real-time
-at the cost of more HTTP fetches per 5h cycle (no LLM token impact)."""
+Written atomically via tempfile + os.replace; consumed by usage_fetch.py
+and statusline.py."""
 
-USAGE_LOCK_FILE = CACHE_ROOT / "usage.lock"
-"""Lock to coalesce concurrent fetches; TTL is USAGE_LOCK_TTL_SEC."""
+USAGE_LOCK_FILE = USAGE_CACHE_ROOT / "oauth-usage.lock"
+"""Lock to coalesce concurrent fetches; TTL is USAGE_LOCK_TTL_SEC.
+Acquired via O_CREAT|O_EXCL in usage_fetch.py."""
+
+USAGE_POLICY_FILE = USAGE_CACHE_ROOT / ".policy.json"
+"""Optional per-user override for cache_ttl_sec / lock_ttl_sec. If absent
+or unreadable, fallback to baked-in defaults (60 / 30). Loaded once at
+module import — changes require process restart."""
 
 CREDENTIALS_FILE = Path.home() / ".claude" / ".credentials.json"
 """OAuth token source. Reloaded on every fetch (no token caching).
@@ -96,10 +110,12 @@ def state_file_for(session_id: str) -> Path:
     return CACHE_ROOT / f"{session_id}.json"
 
 
-NON_STATE_FILENAMES = frozenset({"usage.json", "usage.lock", "ttl_health.json"})
+NON_STATE_FILENAMES = frozenset({"ttl_health.json"})
 """CACHE_ROOT files that are NOT per-session state. State scanners must
 skip these — otherwise reap() destroys the throttle file (ttl_health.json)
-and hook._find_active_state_file picks them up as a phantom session."""
+and hook._find_active_state_file picks it up as a phantom session.
+The OAuth usage cache/lock previously lived in CACHE_ROOT but moved to
+USAGE_CACHE_ROOT, so they no longer need protection here."""
 
 
 # ─── HTTP / API ─────────────────────────────────────────────────────────────
@@ -113,8 +129,25 @@ USAGE_API_HEADERS_TEMPLATE = {
 }
 USAGE_API_TIMEOUT_SEC = 8
 
-USAGE_CACHE_TTL_SEC = 60
-USAGE_LOCK_TTL_SEC = 30
+
+def _load_policy() -> dict:
+    """Read optional .policy.json override. Returns empty dict on any failure
+    — caller falls back to baked-in defaults. Loaded once at module import
+    time (changes require process restart)."""
+    try:
+        return json.loads(USAGE_POLICY_FILE.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError):
+        return {}
+
+
+_POLICY = _load_policy()
+
+USAGE_CACHE_TTL_SEC = int(_POLICY.get("cache_ttl_sec", 60))
+"""Disk cache TTL. Default 60s. Override via
+~/.claude/cache/usage/.policy.json key 'cache_ttl_sec'."""
+
+USAGE_LOCK_TTL_SEC = int(_POLICY.get("lock_ttl_sec", 30))
+"""Lock TTL. Default 30s. Override via .policy.json key 'lock_ttl_sec'."""
 
 
 # ─── Self-test ──────────────────────────────────────────────────────────────
@@ -129,8 +162,12 @@ if __name__ == "__main__":
         "MIN_SLEEP_SEC": MIN_SLEEP_SEC,
         "MAX_SLEEP_SEC": MAX_SLEEP_SEC,
         "CACHE_ROOT": str(CACHE_ROOT),
+        "USAGE_CACHE_ROOT": str(USAGE_CACHE_ROOT),
         "USAGE_CACHE_FILE": str(USAGE_CACHE_FILE),
         "USAGE_LOCK_FILE": str(USAGE_LOCK_FILE),
+        "USAGE_POLICY_FILE": str(USAGE_POLICY_FILE),
+        "USAGE_CACHE_TTL_SEC": USAGE_CACHE_TTL_SEC,
+        "USAGE_LOCK_TTL_SEC": USAGE_LOCK_TTL_SEC,
         "CREDENTIALS_FILE": str(CREDENTIALS_FILE),
         "USAGE_API_URL": USAGE_API_URL,
     }

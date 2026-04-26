@@ -59,11 +59,16 @@ continuous/
     └── loop_check.py        /loop-context detector (transcript-based)
 ```
 
-State and cache live at `~/.claude/cache/continuous/`:
+State and cache live at two locations:
+
+`~/.claude/cache/continuous/` — skill-private runtime files:
 - `<session_id>.json` — per-session state
-- `usage.json` — 60s API response cache
-- `usage.lock` — 30s lock to coalesce concurrent fetches
 - `ttl_health.json` — cached TTL health-check (~30 day throttle)
+
+`~/.claude/cache/usage/` — shared OAuth usage cache (also read by other consumers on the same machine — e.g. a custom statusline):
+- `oauth-usage.json` — disk cache of `/api/oauth/usage` responses (TTL `cache_ttl_sec`, default 60s)
+- `oauth-usage.lock` — lock coalescing concurrent fetches (TTL `lock_ttl_sec`, default 30s)
+- `.policy.json` (optional) — per-user TTL override (see [Configuration](#configuration))
 
 ## Install
 
@@ -135,6 +140,26 @@ The skill is intentionally minimal. There are two thresholds:
 | 7-day  | hardcoded 99 | `constants.py:SEVEN_DAY_THRESHOLD` | terminal — no resume |
 
 7-day is hardcoded because reset is up to 7 days away — sleep-and-retry is wasteful at that scale, terminal is the right behavior.
+
+### OAuth usage cache TTL override (optional)
+
+The OAuth usage cache and its lock have two timing knobs, both defaulting to sensible values baked into `constants.py`. To override, create `~/.claude/cache/usage/.policy.json`:
+
+```json
+{
+  "cache_ttl_sec": 60,
+  "lock_ttl_sec": 30
+}
+```
+
+| Key | Default | Effect |
+|---|---|---|
+| `cache_ttl_sec` | 60 | How long a `/api/oauth/usage` response is reused before re-fetch. Lower = fresher numbers in the rate-limit hook, more HTTP fetches per 5h cycle (no LLM token impact). |
+| `lock_ttl_sec` | 30 | Lock TTL — concurrent fetchers wait on the lock to coalesce into one HTTP call. Should be ≥ typical fetch latency. |
+
+The file is optional. If absent or a key is missing, defaults apply. Values are loaded once at module import — restart Claude Code (and any independent consumer reading the same cache) for changes to take effect.
+
+The file lives under `~/.claude/cache/usage/` rather than the skill directory because it is per-machine runtime configuration, not part of the skill's source. Cloning this repo does not ship the file.
 
 ## Cache TTL alignment
 

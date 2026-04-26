@@ -158,3 +158,7 @@ When the task is genuinely done:
 - Never call ScheduleWakeup with a prompt missing `/loop ` prefix.
 - Never write state without the `CONTINUOUS_SELF_PROBE=1` prefix.
 - Wake-turn text is permanent transcript bloat — keep it to one line.
+
+## Configuration override
+
+OAuth usage cache TTLs are user-configurable via the optional `~/.claude/cache/usage/.policy.json` (keys `cache_ttl_sec`, `lock_ttl_sec`; defaults 60 / 30s). Loaded once at module import — process restart required for changes. See README §Configuration.
