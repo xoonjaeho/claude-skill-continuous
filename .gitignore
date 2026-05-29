@@ -16,3 +16,7 @@ venv/
 Thumbs.db
 *.tmp
 *.tmp.*
+
+# Local-only docs - synced scaffolds (.claude/rules/) and internal docs, never committed (see docs/SETUP.md)
+/.claude/
+/docs/
