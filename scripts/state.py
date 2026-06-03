@@ -302,7 +302,11 @@ def _cli() -> int:
             # Strip trailing newline that POSIX heredocs append before
             # the EOF terminator. Do NOT use .strip() — leading whitespace
             # is legal in tasks and must be preserved.
-            task = sys.stdin.read().rstrip("\n")
+            # Read raw bytes and decode UTF-8 explicitly: on Windows the default
+            # stdin text encoding (cp949/mbcs) mangles the UTF-8 heredoc bytes of
+            # a non-ASCII task into lone surrogates, which later trip an API
+            # content filter when the task rides into the wake prompt.
+            task = sys.stdin.buffer.read().decode("utf-8").rstrip("\n")
         else:
             if len(args.init) != 3:
                 p.error("--init takes exactly 3 args: SID THRESHOLD TASK")
