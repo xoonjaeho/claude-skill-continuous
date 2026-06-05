@@ -54,8 +54,14 @@ MIN_SLEEP_SEC = 60
 """Floor for ScheduleWakeup delaySeconds. Protects against negative
 reset_remaining_sec (stale cache, clock skew)."""
 
-MAX_SLEEP_SEC = 3600
-"""ScheduleWakeup hard ceiling per the harness."""
+MAX_SLEEP_SEC = 3300
+"""Sleep ceiling, held below the 1h (3600s) prompt-cache TTL. The harness
+hard-clamps ScheduleWakeup to 3600s, but a full ~3600s sleep plus scheduling
+overhead lands past the cache TTL: the prompt cache expires mid-sleep and the
+context is re-written to the 1h tier on wake instead of read (measured — a
+3649s gap re-created ~100k tokens at the ~2x write rate, vs a normal turn that
+reads the cached context at ~0.1x). 3300 keeps each sleep below the TTL (with ~300s margin
+for overhead) so wakes re-enter on a cache read, not a re-write."""
 
 SEVEN_DAY_THRESHOLD = 99
 """Hard terminal threshold for the 7-day axis. The user-supplied threshold

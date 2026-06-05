@@ -1,6 +1,6 @@
 """Measure prompt-cache TTL behavior in this user's transcripts.
 
-Two signals:
+Three signals:
 
   (a) Write-tier ratio — `cache_creation.ephemeral_1h_input_tokens` vs
       `cache_creation.ephemeral_5m_input_tokens`. The ONLY direct evidence
@@ -9,12 +9,29 @@ Two signals:
 
   (b) Wake-turn cache hit — for assistant turns immediately following a
       `/loop /continuous …` user message, the ratio of `cache_read_input_tokens`
-      to `input_tokens`. Large ratio = cache survived the sleep window.
+      to `input_tokens`. Large ratio = cache survived the sleep window. NOTE:
+      unreliable for the boundary-miss mode — see (c).
+
+  (c) Wake-turn re-write fraction — `eph_1h / (cache_read + eph_1h)`, computed
+      PER wake (worst wake, not aggregated — an intermittent miss must not be
+      diluted). Targets the boundary-miss mode that (b) is blind to: when a
+      sleep overruns the 1h TTL the context expires and is RE-WRITTEN to the 1h
+      tier on wake — `eph_1h` spikes toward full-context size while
+      `input_tokens` stays tiny, so (b) stays high and looks healthy (a measured
+      3649s miss scored 12,854 on (b) yet re-wrote ~80% of context). A wake
+      fraction > 0.5 flags it; remedy is to lower MAX_SLEEP_SEC below the 1h TTL.
+      DETECTION: a wake lands as a user entry with isMeta=True whose text starts
+      with "/loop /continuous" (validated against real ScheduleWakeup injections;
+      doc bodies are isMeta too but start with headers, so startswith excludes
+      them, and typed first-activations do not produce such an entry — so no
+      cold-cache false positive). Not yet exercised end-to-end on a completed
+      `/loop /continuous` wake, so treat the first live numbers as first-run data.
 
 Run periodically (e.g. monthly) to detect regression. Anthropic has silently
 flipped default cache TTL behavior in the past, and certain telemetry-disable
-configurations are known to break the 1h tier. If write_ratio drops below ~5:1
-or wake-turn read/input collapses, cache is no longer surviving sleeps.
+configurations are known to break the 1h tier. If write_ratio drops below ~5:1,
+wake-turn re-write fraction exceeds ~0.5, or wake-turn read/input collapses,
+cache is no longer surviving sleeps.
 
 CLI:
   python measure_cache_ttl.py                # human-readable report
@@ -67,20 +84,26 @@ def _scan(transcripts: int) -> dict:
                         for b in content:
                             if isinstance(b, dict) and b.get("type") in ("text", None):
                                 text += b.get("text", "") or ""
-                    # isMeta filter: SKILL bodies are loaded as user-role
-                    # isMeta=True blocks and contain the literal "/loop
-                    # /continuous" example in their docs — without this
-                    # filter, every first activation creates a phantom
-                    # "wake" entry that dilutes the regression signal.
+                    # Wake detection. A ScheduleWakeup-fired wake is injected
+                    # as a user entry with isMeta=True whose content IS the wake
+                    # prompt — so its text STARTS WITH the WAKE_PROMPT_FORMAT
+                    # prefix "/loop /continuous" (verified against real wake
+                    # injections in transcripts). SKILL doc bodies are also
+                    # isMeta=True and mention "/loop /continuous" in prose, but
+                    # start with frontmatter/headers, so startswith (not the old
+                    # substring `in`) excludes them. The earlier `not isMeta`
+                    # test was inverted — it dropped every real wake (all are
+                    # isMeta=True), which is why no wake ever scored.
                     if (e.get("type") == "user"
-                            and not e.get("isMeta")
-                            and "/loop /continuous" in text):
+                            and e.get("isMeta")
+                            and text.strip().startswith("/loop /continuous")):
                         prev_was_loop_continuous = True
                         continue
                     if prev_was_loop_continuous and e.get("type") == "assistant":
                         wakes.append({
                             "input": usage.get("input_tokens", 0),
                             "read": usage.get("cache_read_input_tokens", 0),
+                            "eph1h": cc.get("ephemeral_1h_input_tokens", 0),
                         })
                         prev_was_loop_continuous = False
         except OSError:
@@ -94,16 +117,22 @@ def _report(data: dict) -> str:
     wakes = data["wakes"]
     write_ratio = t["1h_write"] / max(t["5m_write"], 1)
 
+    rewrite_frac = 0.0
     if wakes:
         avg_input = sum(w["input"] for w in wakes) / len(wakes)
         avg_read = sum(w["read"] for w in wakes) / len(wakes)
+        per_wake_frac = [w.get("eph1h", 0) / max(w["read"] + w.get("eph1h", 0), 1)
+                         for w in wakes]
+        rewrite_frac = max(per_wake_frac)  # worst wake, not aggregate (no dilution)
+        miss_wakes = sum(1 for fr in per_wake_frac if fr > 0.5)
         hits = sum(1 for w in wakes if w["read"] > w["input"])
         wake_summary = (
             f"wake-turn assistant entries: {len(wakes)} "
             f"(cache hits: {hits}/{len(wakes)})\n"
             f"  avg input_tokens     = {avg_input:>10.0f}\n"
             f"  avg cache_read_input = {avg_read:>10.0f}\n"
-            f"  read/input ratio     = {avg_read / max(avg_input, 1):>10.0f}"
+            f"  read/input ratio     = {avg_read / max(avg_input, 1):>10.0f}\n"
+            f"  worst re-write frac  = {rewrite_frac:>10.1%}  ({miss_wakes}/{len(wakes)} wakes >50% = boundary miss)"
         )
     else:
         wake_summary = "wake-turn assistant entries: 0 (no /loop /continuous activity yet)"
@@ -116,6 +145,9 @@ def _report(data: dict) -> str:
     if wakes and (sum(w["read"] for w in wakes) / max(sum(w["input"] for w in wakes), 1)) < 10:
         health = "REGRESSION SUSPECTED"
         notes.append("wake-turn read/input < 10: cache not surviving sleeps")
+    if rewrite_frac > 0.5:
+        health = "REGRESSION SUSPECTED"
+        notes.append("wake-turn re-write > 50%: sleep overrunning 1h TTL (boundary miss)")
 
     out = [
         f"transcripts scanned : {len(data['files'])}",
@@ -137,8 +169,8 @@ def health_check(transcripts: int = 10) -> dict:
 
     Returns:
         {"status": "ok"|"regression", "write_ratio": float,
-         "wake_read_input_ratio": float|None, "wake_hits": "9/10"|...,
-         "notes": [...], "recommended_action": str|None}
+         "wake_read_input_ratio": float|None, "wake_rewrite_fraction": float|None,
+         "wake_hits": "9/10"|..., "notes": [...], "recommended_action": str|None}
 
     `recommended_action` is the one-line user-facing remediation hint shown
     alongside the regression notification.
@@ -152,7 +184,8 @@ def health_check(transcripts: int = 10) -> dict:
     status = "ok"
     if t["1h_write"] + t["5m_write"] == 0:
         return {"status": "ok", "write_ratio": None,
-                "wake_read_input_ratio": None, "wake_hits": "0/0",
+                "wake_read_input_ratio": None, "wake_rewrite_fraction": None,
+                "wake_hits": "0/0",
                 "notes": ["no cache writes in scanned transcripts"],
                 "recommended_action": None}
     if write_ratio < 5:
@@ -161,13 +194,30 @@ def health_check(transcripts: int = 10) -> dict:
         actions.append("Check that DISABLE_TELEMETRY and "
                        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC are NOT set")
     wake_ratio: float | None = None
+    wake_rewrite_fraction: float | None = None
     wake_hits = f"0/{len(wakes)}"
     if wakes:
         total_in = sum(w["input"] for w in wakes)
         total_rd = sum(w["read"] for w in wakes)
         wake_ratio = total_rd / max(total_in, 1)
+        # Per-wake, NOT aggregate: one intermittent boundary miss among many
+        # hits must not be diluted below threshold by sum/sum. (Assumes captured
+        # wakes are post-sleep resumes — a first activation has a cold cache and
+        # scores ~1.0; the wake detector must exclude first-activations before
+        # this is relied on. See module docstring caveats.)
+        per_wake_frac = [w.get("eph1h", 0) / max(w["read"] + w.get("eph1h", 0), 1)
+                         for w in wakes]
+        wake_rewrite_fraction = max(per_wake_frac)
+        miss_wakes = sum(1 for fr in per_wake_frac if fr > 0.5)
         hits = sum(1 for w in wakes if w["read"] > w["input"])
         wake_hits = f"{hits}/{len(wakes)}"
+        if miss_wakes:
+            status = "regression"
+            notes.append(
+                f"{miss_wakes}/{len(wakes)} wake(s) re-wrote >50% of context "
+                f"(worst {wake_rewrite_fraction:.0%}) — sleep overrunning the "
+                "1h cache TTL (boundary miss)")
+            actions.append("Lower MAX_SLEEP_SEC below the 1h (3600s) cache TTL")
         if wake_ratio < 10:
             status = "regression"
             notes.append("wake-turn read/input < 10 — cache not surviving sleeps")
@@ -176,6 +226,7 @@ def health_check(transcripts: int = 10) -> dict:
     recommended_action = " | ".join(actions) if actions else None
     return {"status": status, "write_ratio": round(write_ratio, 1),
             "wake_read_input_ratio": round(wake_ratio, 1) if wake_ratio is not None else None,
+            "wake_rewrite_fraction": round(wake_rewrite_fraction, 3) if wake_rewrite_fraction is not None else None,
             "wake_hits": wake_hits, "notes": notes,
             "recommended_action": recommended_action}
 

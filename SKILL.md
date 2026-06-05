@@ -99,7 +99,7 @@ All sleep branches share this pattern: update state, schedule wake, emit one lin
 ```bash
 CONTINUOUS_SELF_PROBE=1 python ~/.claude/skills/continuous/scripts/state.py --transition {SID} block_sleep --inc block_count --reset-retry
 ```
-- `delay = max(60, min(reset_remaining_sec + 60, 3600))`
+- `delay = max(60, min(reset_remaining_sec + 60, 3300))` — the 3300 cap stays under the 1h prompt-cache TTL; a full 3600s sleep overruns it and re-writes the whole context on wake instead of reading from cache (see `constants.MAX_SLEEP_SEC`).
 - `ScheduleWakeup(delaySeconds=delay, prompt="/loop /continuous {threshold} {task}", reason="rate limit hit, sleeping {minutes}m")`
 - Output: `Rate limit ({util}%). Sleeping {minutes}m.`
 
@@ -143,7 +143,7 @@ If parse fails:
 ```bash
 CONTINUOUS_SELF_PROBE=1 python ~/.claude/skills/continuous/scripts/state.py --transition {SID} parse_fail_sleep --inc parse_fail_count
 ```
-`ScheduleWakeup(delaySeconds=3600, prompt=…, reason="marker parse failed, fallback 1h sleep")`. End.
+`ScheduleWakeup(delaySeconds=3300, prompt=…, reason="marker parse failed, fallback 55m sleep")`. End.
 
 ## Completion
 

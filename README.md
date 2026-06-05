@@ -35,7 +35,7 @@ Examples:
 
 [on block]
    skill body parses marker
-   ├─ axis=five_hour → ScheduleWakeup(min(reset+60, 3600), same prompt)
+   ├─ axis=five_hour → ScheduleWakeup(min(reset+60, 3300), same prompt)
    └─ axis=seven_day (≥99% only) → terminate, push notify, no wakeup
 
 [on wake]
@@ -165,14 +165,31 @@ The file lives under `~/.claude/cache/usage/` rather than the skill directory be
 
 ## Cache TTL alignment
 
-`ScheduleWakeup` sleeps up to 1h. Anthropic's prompt-cache TTL is also 1h on Pro/Max plans with telemetry on (auto-applied on recent Claude Code builds). TTL is a **last-access timer**, so each wake's read refreshes the window — `/continuous` cycles re-enter with cache hit, not miss. **No skill change is needed for this to work**; the table below is for detecting future regression.
+Sleeps are capped at `MAX_SLEEP_SEC` (3300s), held just under Anthropic's 1h (3600s) prompt-cache TTL tier (observed active on Pro/Max with telemetry on). The TTL is a **last-access timer** running from the last *pre-sleep* cache write — and nothing accesses the cache *during* a sleep, so the window is NOT refreshed mid-sleep. A full 3600s sleep (plus scheduling overhead) therefore overruns the TTL: the cache expires and the whole context is re-written to the 1h tier on wake at the ~2x write rate, instead of read at ~0.1x.
 
-| Signal (run `python scripts/measure_cache_ttl.py`) | Healthy | Regression hint | Mitigation |
+> **Requirement — the 1h cache tier must be active.** The whole approach is load-bearing on Anthropic granting the 1h (3600s) prompt-cache TTL. With only the default 5min (300s) tier, *every* sleep ≥ 5min misses regardless of the cap — no sub-300s cap keeps `/continuous` useful. The 1h tier is observed active on Pro/Max with telemetry on (correlation seen in `measure_cache_ttl.py`, not a documented guarantee); it is **not** a reliable manual toggle (`ENABLE_PROMPT_CACHING_1H=1` is documented for API-key / Bedrock / Vertex / Foundry, untested on OAuth/Pro·Max). Verify with `python scripts/measure_cache_ttl.py`: a `write tier ratio` ≥ 5 (ideally ≫) means the 1h tier is being written. If it sits near 1, the tier is off and `/continuous` cannot ride rate-limit windows cheaply — ensure `DISABLE_TELEMETRY` and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` are NOT set.
+
+Measured (single ~1h hop, ~160k-token conversation):
+
+| Sleep gap | `cache_read` | `eph_1h` (re-write) | Outcome | Rel. cost |
+|---|---|---|---|---|
+| 3649s (over TTL) | 25,709 | 100,670 | MISS — ~80% of context re-written at 2x | ~1.0 |
+| 3312s (capped, under TTL) | 158,820 | 395 | HIT — context read from cache | ~0.1 |
+
+So the 3300 cap cuts per-hop cost ~10x. **This is why the cap exists** — at 3600s every hop pays the re-write premium.
+
+### Detecting regression
+
+Run `python scripts/measure_cache_ttl.py` periodically (e.g. monthly):
+
+| Signal | Healthy | Regression hint | Mitigation |
 |---|---|---|---|
 | `write tier ratio` (1h : 5m) | ≥ 5 | < 5 | Telemetry coupling — make sure `DISABLE_TELEMETRY` and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` are NOT set |
-| wake-turn `read/input ratio` | ≫ 10 | ≤ 10 | Anthropic-side default may have flipped to 5min. Try `export ENABLE_PROMPT_CACHING_1H=1` and re-measure (note: this var is documented for API key / Bedrock / Vertex / Foundry; OAuth/Pro/Max coverage is untested upstream so it may be a no-op) |
+| wake-turn `eph_1h` (cache_creation) | ≪ context size | ≈ context size | Sleep is overrunning the TTL — lower `MAX_SLEEP_SEC` further |
 
-`cache_read_input_tokens` is a single flat field — per-tier read breakdown is not exposed by Claude Code transcripts, so 1h vs 5m read split must be inferred from the write-tier ratio. Recommend a monthly re-run of the measurement script.
+> **Blind spot:** the wake-turn `read/input` ratio is NOT a reliable miss signal. A boundary miss re-writes the context to the 1h tier with tiny `input_tokens`, so `read/input` stays high (measured 12,854 at the 3649s miss) and looks healthy. Watch wake-turn `eph_1h` (`cache_creation.ephemeral_1h_input_tokens`) instead — it spikes toward full-context size on a miss. `measure_cache_ttl.py`'s current `read/input` check does not catch this.
+
+`cache_read_input_tokens` is a single flat field — per-tier read breakdown is not exposed by Claude Code transcripts, so 1h vs 5m read split must be inferred from the write-tier ratio.
 
 The skill auto-runs the health check (throttled to once per 30 days) on each `/continuous` activation. On regression the user is notified via `PushNotification` and a one-line warning is prepended to the wake/start message.
 
@@ -221,6 +238,7 @@ python scripts/constants.py                            # print all constants + s
 - Python 3.9+ (stdlib only — no `requests`, no `dateutil`, no third-party)
 - Claude Code build with `ScheduleWakeup` tool support and the built-in `/loop` dynamic mode
 - OAuth credentials at `~/.claude/.credentials.json` (Pro/Max subscription)
+- The **1h prompt-cache TTL tier** active (observed on Pro/Max with telemetry on) — load-bearing; see [Cache TTL alignment](#cache-ttl-alignment) for why and how to verify
 
 `/loop` is a Claude Code built-in command, not a separate install. `loop_check.py` detects it by matching the literal SKILL.md header line `# /loop — schedule a recurring or self-paced prompt` in the transcript. If Claude Code changes that header upstream, edit `LOOP_BODY_HEADER` in `scripts/loop_check.py` to match.
 
