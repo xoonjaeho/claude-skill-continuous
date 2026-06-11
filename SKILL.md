@@ -1,6 +1,6 @@
 ---
 name: continuous
-description: Maintain session work continuity across Claude.ai rate-limit boundaries. Auto-pauses when utilization reaches a threshold, sleeps in 1-hour chunks via ScheduleWakeup, then resumes the same task in the same conversation. MUST be invoked via /loop dynamic mode (e.g. `/loop /continuous 95 "<task>"`); refuses otherwise.
+description: Maintain session work continuity across Claude.ai rate-limit boundaries. Auto-pauses when utilization reaches a threshold, sleeps in ~55-minute chunks via ScheduleWakeup, then resumes the same task in the same conversation. MUST be invoked via /loop dynamic mode (e.g. `/loop /continuous 95 "<task>"`); refuses otherwise.
 ---
 
 # /continuous — session continuity across rate limits
@@ -74,6 +74,9 @@ CONTINUOUS_TASK_BOUNDARY_7F3A1E_EOF
 Loop-context check is skipped: state existence implies the prior activation was in /loop, and the wake prompt carries the `/loop ` prefix anyway. (Edge case: if the user manually re-typed `/continuous` outside /loop while a state file exists, this is treated as authorial intent to resume — not a misuse.)
 
 Decide from `usage`:
+- `usage == null` (usage fetch failed this turn — see `errors`):
+  - any `errors` entry contains `401 Unauthorized` → token expired, not self-recoverable. `PushNotification(message="/continuous paused: usage 401 (token expired). Restart Claude Code, then re-invoke /loop /continuous.")` (skip if tool unavailable), then `CONTINUOUS_SELF_PROBE=1 python ~/.claude/skills/continuous/scripts/state.py --delete {SID}`, output one line `Usage 401 (token expired). Ending; re-invoke after restart.`, end. Do **not** ScheduleWakeup.
+  - else → transient (network blip, malformed response). `CONTINUOUS_SELF_PROBE=1 python ~/.claude/skills/continuous/scripts/state.py --transition {SID} retry_60s --inc retry_60s`, then `ScheduleWakeup(delaySeconds=60, prompt="/loop /continuous {threshold} {task}", reason="usage fetch failed, 60s retry")`, output `Usage fetch failed; 60s retry.` This retries indefinitely at 60s so a longer outage does not terminate the task; only a 401 (above) ends it.
 - `seven_day_util >= 99` → §Seven-day block.
 - `five_hour_util >= threshold`:
   - `state.retry_60s >= 3` → §Block sleep (treat as fresh; reset_retry).
