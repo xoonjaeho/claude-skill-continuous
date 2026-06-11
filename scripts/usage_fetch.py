@@ -20,6 +20,7 @@ Used by:
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import sys
@@ -81,14 +82,18 @@ def _read_cache() -> dict[str, Any] | None:
     """
     try:
         st = C.USAGE_CACHE_FILE.stat()
-    except FileNotFoundError:
+    except OSError:
+        # FileNotFoundError (no cache yet) or a transient PermissionError /
+        # Windows AV-lock — either way, fall through to a live fetch.
         return None
     age = time.time() - st.st_mtime
     if age < 0 or age >= C.USAGE_CACHE_TTL_SEC:
         return None
     try:
         return json.loads(C.USAGE_CACHE_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
+        # ValueError covers both JSONDecodeError and a UnicodeDecodeError from a
+        # cache file with invalid UTF-8 bytes (disk corruption / foreign writer).
         return None
 
 
@@ -177,6 +182,16 @@ def _http_fetch(token: str) -> dict[str, Any]:
         raise UsageFetchError(f"network error: {e.reason}") from e
     except json.JSONDecodeError as e:
         raise UsageFetchError(f"response not JSON: {e}") from e
+    except http.client.HTTPException as e:
+        # IncompleteRead / BadStatusLine / LineTooLong on a truncated or
+        # malformed response are HTTPException-only (not OSError/URLError), so
+        # they would otherwise escape and crash the probe.
+        raise UsageFetchError(f"malformed HTTP response: {e}") from e
+    except OSError as e:
+        # Read timeouts surface as socket.timeout (TimeoutError), which is an
+        # OSError but not always a URLError; without this catch it escapes and
+        # crashes the probe (probe._do_usage catches only UsageFetchError).
+        raise UsageFetchError(f"network error: {e}") from e
 
 
 # ─── Parse ──────────────────────────────────────────────────────────────────
@@ -195,28 +210,48 @@ def _reset_remaining_sec(reset_at: datetime | None) -> int | None:
     return int((reset_at - now).total_seconds())
 
 
-def _parse_body(body: dict[str, Any], from_cache: bool) -> UsageResult:
+def _parse_body(body: Any, from_cache: bool) -> UsageResult:
+    # A non-dict body or section (API/cache returns a string/list/number) must
+    # degrade to a clean UsageFetchError — `.get()` on a non-dict raises
+    # AttributeError, which is outside the field-coercion try below and would
+    # escape to crash the whole probe.
+    if not isinstance(body, dict):
+        raise UsageFetchError(f"usage body is not an object: {type(body).__name__}")
     fh = body.get("five_hour") or {}
     sd = body.get("seven_day") or {}
     eu = body.get("extra_usage") or {}
 
-    if "utilization" not in fh or "resets_at" not in fh:
-        raise UsageFetchError(f"five_hour fields missing: {fh!r}")
+    if not (isinstance(fh, dict) and isinstance(sd, dict) and isinstance(eu, dict)):
+        raise UsageFetchError(
+            f"usage sections must be objects: "
+            f"five_hour={fh!r} seven_day={sd!r} extra_usage={eu!r}"
+        )
 
-    fh_reset = _parse_iso(fh.get("resets_at"))
-    sd_reset = _parse_iso(sd.get("resets_at"))
+    if fh.get("utilization") is None or fh.get("resets_at") is None:
+        raise UsageFetchError(f"five_hour fields missing or null: {fh!r}")
 
-    return UsageResult(
-        five_hour_util=float(fh["utilization"]),
-        five_hour_resets_at=fh["resets_at"],
-        five_hour_reset_remaining_sec=_reset_remaining_sec(fh_reset) or 0,
-        seven_day_util=float(sd.get("utilization") or 0.0),
-        seven_day_resets_at=sd.get("resets_at"),
-        seven_day_reset_remaining_sec=_reset_remaining_sec(sd_reset),
-        extra_usage_enabled=bool(eu.get("is_enabled", False)),
-        fetched_at=datetime.now(timezone.utc).isoformat(),
-        from_cache=from_cache,
-    )
+    # A malformed field type (non-numeric utilization, unparseable resets_at)
+    # must degrade to a clean UsageFetchError, not an escaping TypeError/
+    # ValueError. probe.py's _do_usage catches only UsageFetchError; anything
+    # else kills the whole probe (no JSON emitted, no usage=null degrade).
+    try:
+        fh_reset = _parse_iso(fh["resets_at"])
+        sd_reset = _parse_iso(sd.get("resets_at"))
+        return UsageResult(
+            five_hour_util=float(fh["utilization"]),
+            five_hour_resets_at=fh["resets_at"],
+            five_hour_reset_remaining_sec=_reset_remaining_sec(fh_reset) or 0,
+            seven_day_util=float(sd.get("utilization") or 0.0),
+            seven_day_resets_at=sd.get("resets_at"),
+            seven_day_reset_remaining_sec=_reset_remaining_sec(sd_reset),
+            extra_usage_enabled=bool(eu.get("is_enabled", False)),
+            fetched_at=datetime.now(timezone.utc).isoformat(),
+            from_cache=from_cache,
+        )
+    except (ValueError, TypeError, AttributeError) as e:
+        # AttributeError covers a non-string resets_at reaching _parse_iso's
+        # .replace() (the presence check only rejects None, not e.g. an int).
+        raise UsageFetchError(f"malformed usage field: {e}") from e
 
 
 # ─── Public API ─────────────────────────────────────────────────────────────
@@ -230,7 +265,12 @@ def fetch_usage(use_cache: bool = True) -> UsageResult:
     if use_cache:
         cached = _read_cache()
         if cached is not None:
-            return _parse_body(cached, from_cache=True)
+            try:
+                return _parse_body(cached, from_cache=True)
+            except UsageFetchError:
+                # Wrong-shape cached body must not poison the whole TTL window:
+                # fall through to a live fetch instead of failing every read.
+                pass
 
     # Race-free lock acquisition via O_CREAT|O_EXCL.
     got_lock = _take_lock()
@@ -241,15 +281,18 @@ def fetch_usage(use_cache: bool = True) -> UsageResult:
         try:
             stale = json.loads(C.USAGE_CACHE_FILE.read_text(encoding="utf-8"))
             return _parse_body(stale, from_cache=True)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError, UsageFetchError):
             time.sleep(1)
             got_lock = _take_lock()
 
     try:
         token = _load_access_token()
         body = _http_fetch(token)
+        # Validate BEFORE caching: a malformed body must never reach the shared
+        # cache, or it would re-fail every read for the full TTL window.
+        result = _parse_body(body, from_cache=False)
         _write_cache(body)
-        return _parse_body(body, from_cache=False)
+        return result
     finally:
         if got_lock:
             _release_lock()
