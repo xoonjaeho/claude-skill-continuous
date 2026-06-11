@@ -1,6 +1,6 @@
 # /continuous — Session Continuity Across Rate Limits
 
-A Claude Code skill that keeps a long-running task alive across Claude.ai's 5-hour rate-limit boundaries. When utilization reaches a threshold, the skill pauses (via `ScheduleWakeup`), sleeps in 1-hour chunks, and automatically resumes the same task in the same conversation when the limit resets.
+A Claude Code skill that keeps a long-running task alive across Claude.ai's 5-hour rate-limit boundaries. When utilization reaches a threshold, the skill pauses (via `ScheduleWakeup`), sleeps in ~55-minute chunks (held just under the 1-hour cache TTL), and automatically resumes the same task in the same conversation when the limit resets.
 
 ## Quick start
 
@@ -199,7 +199,7 @@ The skill auto-runs the health check (throttled to once per 30 days) on each `/c
 |---|---|---|
 | `/continuous works only inside /loop dynamic mode.` | invoked without `/loop ` prefix | re-invoke via `/loop /continuous …` |
 | 401 from usage fetch | `accessToken` expired | restart Claude Code (it refreshes credentials) |
-| Hook blocks unrelated session | state file leaked from prior crash, or two Claude Code sessions running simultaneously where one has `/continuous` active | run `python scripts/state.py --reap` (or wait — auto-reaps after 7d). The hook only auto-disambiguates between sessions when the tool payload includes `session_id`; without it, a single leftover state file applies to all sessions on the machine. |
+| Hook blocks unrelated session | state file leaked from prior crash, or two Claude Code sessions running simultaneously where one has `/continuous` active | run `python scripts/state.py --reap` (or let it be reaped on the next `/continuous` activation that needs disambiguation — there is no passive background timer). The hook only auto-disambiguates between sessions when the tool payload includes `session_id`; without it, a single leftover state file applies to all sessions on the machine. |
 | `parse_fail_count` increasing | hook stderr marker drifted | check `BLOCK_MARKER_FORMAT` matches `BLOCK_MARKER_REGEX` in `constants.py` |
 | Hook errors block all tools | `settings.json` path wrong | edit `settings.json` externally to fix path; cannot be fixed from inside Claude Code |
 

@@ -252,7 +252,14 @@ def _init_state(session_id: str, threshold: int, task: str) -> Path:
 
 def _transition(session_id: str, action: str,
                 inc: list[str], reset_retry: bool) -> dict[str, Any] | None:
-    """Atomic state mutation. Returns updated state dict, or None if missing."""
+    """Read-modify-write a state field. Returns updated state dict, or None if
+    missing.
+
+    The write itself is atomic (tmp + os.replace in `write`), but the
+    read-modify-write sequence is NOT lock-protected. This is safe only
+    because /continuous transitions are serialized by the single-conversation
+    turn model — never two concurrent writers for one session_id.
+    """
     st = read(session_id)
     if st is None:
         return None
